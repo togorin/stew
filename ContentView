@@ -1,0 +1,2794 @@
+import SwiftUI
+import AVFoundation
+import Supabase
+import PhotosUI
+
+// MARK: - Supabase Client Setup
+let supabaseURLString = "https://tfarmxxdtphvgsklhusl.supabase.co"
+let supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRmYXJteHhkdHBodmdza2xodXNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY4NTU5MzYsImV4cCI6MjA4MjQzMTkzNn0.Y_x0pVj3_slxMTaLsBg_KjG6xu86GDm1q53JvF8szVY"
+
+let supabase = SupabaseClient(
+    supabaseURL: URL(string: supabaseURLString)!,
+    supabaseKey: supabaseAnonKey
+)
+
+// MARK: - Extensions
+extension Date {
+    /// 投稿日時からの経過時間を英語の相対形式で返します 🕰️
+    func timeAgo() -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        formatter.calendar.locale = Locale(identifier: "en_US")
+        return formatter.localizedString(for: self, relativeTo: Date())
+    }
+}
+
+extension View {
+    /// マスクの透明度を反転させるヘルパー
+    func reverseMask<Mask: View>(
+        alignment: Alignment = .center,
+        @ViewBuilder _ mask: () -> Mask
+    ) -> some View {
+        self.mask {
+            Rectangle()
+                .overlay(alignment: alignment) {
+                    mask()
+                        .blendMode(.destinationOut)
+                }
+        }
+    }
+}
+
+// MARK: - Models
+struct Post: Identifiable, Equatable, Decodable {
+    let id: String
+    let createdAt: Date
+    let audioUrl: URL
+    let userId: String
+    let title: String?
+    var likesCount: Int
+    var isLiked: Bool
+    var isFollowingAuthor: Bool = false
+    let author: AuthorProfile?
+    
+    struct AuthorProfile: Decodable, Equatable {
+        let username: String?
+        let avatarUrl: String?
+        enum CodingKeys: String, CodingKey {
+            case username
+            case avatarUrl = "avatar_url"
+        }
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case id, title
+        case createdAt = "created_at"
+        case audioUrl = "audio_url"
+        case userId = "user_id"
+        case likesCount = "likes_count"
+        case isLiked = "is_liked"
+        case author = "profiles"
+    }
+}
+
+struct Profile: Identifiable, Codable, Equatable {
+    var id: String { userId }
+    let userId: String
+    var username: String
+    var avatarUrl: String?
+    var bio: String?
+    enum CodingKeys: String, CodingKey {
+        case userId = "id"
+        case username, bio
+        case avatarUrl = "avatar_url"
+    }
+}
+
+struct BlockRecord: Decodable {
+    let blocked_id: String
+}
+
+struct PostInsertData: Encodable {
+    let title: String
+    let audio_url: String
+    let user_id: String
+    let likes_count: Int
+}
+
+struct LikeRecord: Decodable {
+    let post_id: String
+}
+
+struct FollowRecord: Decodable {
+    let following_id: String
+    let follower_id: String
+}
+
+struct NotificationRecord: Identifiable, Decodable {
+    let id: String
+    let createdAt: Date
+    let type: String
+    let senderId: String
+    let receiverId: String
+    let postId: String?
+    let sender: Profile?
+    var isRead: Bool
+    
+    enum CodingKeys: String, CodingKey {
+        case id, type
+        case createdAt = "created_at"
+        case senderId = "sender_id"
+        case receiverId = "receiver_id"
+        case postId = "post_id"
+        case sender = "profiles"
+        case isRead = "is_read"
+    }
+}
+
+// MARK: - View Models
+
+@MainActor
+class AuthViewModel: ObservableObject {
+    @Published var session: Session?
+    @Published var loading = false
+    @Published var errorMessage: String?
+    @Published var verificationEmailSent = false
+    @Published var resetEmailSent = false
+    @Published var isUpdatingPassword = false
+    
+    private let redirectURL = URL(string: "cotocoto.stew://login-callback")!
+    
+    init() {
+        Task {
+            self.session = try? await supabase.auth.session
+            for await (_, session) in supabase.auth.authStateChanges {
+                self.session = session
+                if session != nil && !isUpdatingPassword {
+                    self.verificationEmailSent = false
+                    self.resetEmailSent = false
+                }
+            }
+        }
+    }
+    
+    func handle(url: URL) {
+        Task {
+            do {
+                if url.absoluteString.contains("type=recovery") {
+                    withAnimation {
+                        resetEmailSent = false
+                        verificationEmailSent = false
+                        isUpdatingPassword = true
+                    }
+                }
+                try await supabase.auth.session(from: url)
+            } catch {
+                print("Deep Link Error: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    func signUp(email: String, password: String, username: String) async {
+        loading = true
+        errorMessage = nil
+        defer {
+            loading = false
+        }
+        do {
+            try await supabase.auth.signUp(
+                email: email,
+                password: password,
+                data: ["username": .string(username)],
+                redirectTo: redirectURL
+            )
+            withAnimation {
+                verificationEmailSent = true
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+    
+    func signIn(email: String, password: String) async {
+        loading = true
+        errorMessage = nil
+        defer {
+            loading = false
+        }
+        do {
+            try await supabase.auth.signIn(email: email, password: password)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+    
+    func sendPasswordResetEmail(email: String) async {
+        loading = true
+        errorMessage = nil
+        do {
+            try await supabase.auth.resetPasswordForEmail(email, redirectTo: redirectURL)
+            withAnimation {
+                resetEmailSent = true
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        loading = false
+    }
+    
+    func updatePassword(newPassword: String) async {
+        loading = true
+        errorMessage = nil
+        do {
+            try await supabase.auth.update(user: UserAttributes(password: newPassword))
+            withAnimation {
+                isUpdatingPassword = false
+                resetEmailSent = false
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        loading = false
+    }
+    
+    func signInWithGoogle() async {
+        do {
+            try await supabase.auth.signInWithOAuth(provider: .google, redirectTo: redirectURL)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+    
+    func signOut() async {
+        try? await supabase.auth.signOut()
+        self.session = nil
+    }
+    
+    func deleteAccount() async {
+        loading = true
+        defer {
+            loading = false
+        }
+        do {
+            try await supabase.rpc("delete_user").execute()
+            try await supabase.auth.signOut()
+            self.session = nil
+        } catch {
+            errorMessage = "Failed to delete account: \(error.localizedDescription)"
+        }
+    }
+    
+    func resetVerificationState() {
+        verificationEmailSent = false
+        resetEmailSent = false
+        isUpdatingPassword = false
+    }
+}
+
+class HomeViewModel: ObservableObject {
+    @Published var posts: [Post] = []
+    @Published var loading = false
+    @Published var currentlyPlayingId: String? = nil
+    @Published var isPlayerPlaying: Bool = false
+    @Published var errorMessage: String? = nil
+    @Published var followingIds: Set<String> = []
+    @Published var blockedUserIds: Set<String> = []
+    @Published var blockedUsers: [Profile] = []
+    
+    @Published var playerProgress: [String: Double] = [:]
+    @Published var playerDurations: [String: Double] = [:]
+    
+    private var playerCache: [String: AVPlayer] = [:]
+    private var timeObservers: [String: Any] = [:]
+    
+    @MainActor
+    func fetchPosts(currentUserId: String?) async {
+        self.loading = true
+        self.errorMessage = nil
+        
+        do {
+            guard let uid = currentUserId else {
+                self.posts = []
+                self.loading = false
+                return
+            }
+
+            let blocks: [BlockRecord] = try await supabase
+                .from("blocks")
+                .select("blocked_id")
+                .eq("blocker_id", value: uid)
+                .execute()
+                .value
+            self.blockedUserIds = Set(blocks.map { $0.blocked_id })
+            
+            let followRecords: [FollowRecord] = try await supabase
+                .from("follows")
+                .select("following_id, follower_id")
+                .eq("follower_id", value: uid)
+                .execute()
+                .value
+            self.followingIds = Set(followRecords.map { $0.following_id })
+            
+            var visibleUserIds = Array(followingIds).map { $0.lowercased() }
+            visibleUserIds.append(uid.lowercased())
+            
+            let fetchedPosts: [Post] = try await supabase
+                .from("posts")
+                .select("*, profiles(username, avatar_url)")
+                .in("user_id", values: visibleUserIds)
+                .order("created_at", ascending: false)
+                .execute()
+                .value
+            
+            let userLikes: [LikeRecord] = try await supabase
+                .from("likes")
+                .select("post_id")
+                .eq("user_id", value: uid)
+                .execute()
+                .value
+            let likedPostIds = Set(userLikes.map { $0.post_id })
+            
+            var updatedPosts = fetchedPosts
+            for i in 0..<updatedPosts.count {
+                updatedPosts[i].isLiked = likedPostIds.contains(updatedPosts[i].id)
+                updatedPosts[i].isFollowingAuthor = followingIds.contains(updatedPosts[i].userId)
+            }
+            
+            updatedPosts = updatedPosts.filter { !blockedUserIds.contains($0.userId) }
+            
+            withAnimation {
+                self.posts = updatedPosts
+            }
+            
+            preloadDurations(for: updatedPosts)
+            
+        } catch {
+            self.errorMessage = "Fetch Error: \(error.localizedDescription)"
+        }
+        self.loading = false
+    }
+    
+    private func preloadDurations(for posts: [Post]) {
+        for post in posts {
+            guard playerDurations[post.id] == nil else { continue }
+            Task {
+                let asset = AVURLAsset(url: post.audioUrl)
+                do {
+                    let duration = try await asset.load(.duration)
+                    let seconds = CMTimeGetSeconds(duration)
+                    if !seconds.isNaN {
+                        await MainActor.run {
+                            self.playerDurations[post.id] = seconds
+                        }
+                    }
+                } catch {
+                    print("Duration preload error: \(error)")
+                }
+            }
+        }
+    }
+    
+    @MainActor
+    func blockUser(targetUserId: String, currentUserId: String) async {
+        do {
+            try await supabase.from("blocks").insert(["blocker_id": currentUserId, "blocked_id": targetUserId]).execute()
+            self.blockedUserIds.insert(targetUserId)
+            withAnimation {
+                self.posts.removeAll { $0.userId == targetUserId }
+            }
+        } catch {
+            print("Block Error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func unblockUser(targetUserId: String, currentUserId: String) async {
+        do {
+            try await supabase.from("blocks")
+                .delete()
+                .eq("blocker_id", value: currentUserId)
+                .eq("blocked_id", value: targetUserId)
+                .execute()
+            self.blockedUserIds.remove(targetUserId)
+            withAnimation {
+                self.blockedUsers.removeAll { $0.userId == targetUserId }
+            }
+            await fetchPosts(currentUserId: currentUserId)
+        } catch {
+            print("Unblock Error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func fetchBlockedUsers(currentUserId: String) async {
+        do {
+            let blocks: [BlockRecord] = try await supabase
+                .from("blocks")
+                .select("blocked_id")
+                .eq("blocker_id", value: currentUserId)
+                .execute()
+                .value
+            
+            let ids = blocks.map { $0.blocked_id }
+            if ids.isEmpty {
+                self.blockedUsers = []
+                return
+            }
+            
+            let profiles: [Profile] = try await supabase
+                .from("profiles")
+                .select()
+                .in("id", values: ids)
+                .execute()
+                .value
+            
+            withAnimation {
+                self.blockedUsers = profiles
+            }
+        } catch {
+            print("Fetch Blocked Users Error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func reportPost(postId: String, currentUserId: String) async {
+        do {
+            try await supabase.from("reports").insert([
+                "reporter_id": currentUserId,
+                "reported_post_id": postId,
+                "reason": "Inappropriate Content"
+            ]).execute()
+        } catch {
+            print("Report Error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func toggleFollow(targetUserId: String, currentUserId: String) async {
+        let isFollowing = followingIds.contains(targetUserId)
+        do {
+            if isFollowing {
+                try await supabase.from("follows").delete().eq("follower_id", value: currentUserId).eq("following_id", value: targetUserId).execute()
+                followingIds.remove(targetUserId)
+            } else {
+                try await supabase.from("follows").insert(["follower_id": currentUserId, "following_id": targetUserId]).execute()
+                followingIds.insert(targetUserId)
+                _ = try? await supabase.from("notifications").insert([
+                    "type": "follow",
+                    "sender_id": currentUserId,
+                    "receiver_id": targetUserId
+                ]).execute()
+            }
+            for i in 0..<posts.count {
+                if posts[i].userId == targetUserId {
+                    posts[i].isFollowingAuthor = !isFollowing
+                }
+            }
+        } catch {
+            print("Follow Toggle Error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func deletePost(post: Post) async {
+        let previousPosts = self.posts
+        
+        withAnimation(.spring(response: 0.4, dampingFraction: 1.2)) {
+            self.posts.removeAll { $0.id == post.id }
+        }
+        
+        playerCache.removeValue(forKey: post.id)
+        playerProgress.removeValue(forKey: post.id)
+        playerDurations.removeValue(forKey: post.id)
+        
+        do {
+            try await supabase.from("posts").delete().eq("id", value: post.id).execute()
+        } catch {
+            withAnimation(.spring(response: 0.4, dampingFraction: 1.2)) {
+                self.posts = previousPosts
+            }
+            self.errorMessage = "Delete Error: \(error.localizedDescription)"
+        }
+    }
+    
+    func handlePlay(post: Post) {
+        if let currentId = currentlyPlayingId, currentId != post.id {
+            playerCache[currentId]?.pause()
+        }
+        let player: AVPlayer
+        if let cached = playerCache[post.id] {
+            player = cached
+        } else {
+            let item = AVPlayerItem(url: post.audioUrl)
+            player = AVPlayer(playerItem: item)
+            playerCache[post.id] = player
+            NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+                if self?.currentlyPlayingId == post.id {
+                    self?.isPlayerPlaying = false
+                    self?.currentlyPlayingId = nil
+                }
+                player.seek(to: .zero)
+                self?.playerProgress[post.id] = 0
+            }
+        }
+        currentlyPlayingId = post.id
+        if player.rate != 0 {
+            player.pause()
+            isPlayerPlaying = false
+        } else {
+            configureAudioSession()
+            player.play()
+            isPlayerPlaying = true
+            setupTimeObserver(for: post.id, player: player)
+        }
+    }
+    
+    private func setupTimeObserver(for postId: String, player: AVPlayer) {
+        if let existing = timeObservers[postId] {
+            player.removeTimeObserver(existing)
+        }
+        let observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in
+            self?.playerProgress[postId] = CMTimeGetSeconds(time)
+        }
+        timeObservers[postId] = observer
+    }
+    
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default)
+            try session.setActive(true)
+        } catch {
+            print("Audio session error: \(error)")
+        }
+    }
+    
+    @MainActor
+    func toggleLike(post: Post, userId: String) async {
+        guard let index = posts.firstIndex(where: { $0.id == post.id }) else { return }
+        
+        let wasLiked = posts[index].isLiked
+        let previousCount = posts[index].likesCount
+        
+        posts[index].isLiked.toggle()
+        posts[index].likesCount += wasLiked ? -1 : 1
+        
+        do {
+            if wasLiked {
+                try await supabase.from("likes")
+                    .delete()
+                    .eq("post_id", value: post.id)
+                    .eq("user_id", value: userId)
+                    .execute()
+            } else {
+                try await supabase.from("likes")
+                    .insert(["post_id": post.id, "user_id": userId])
+                    .execute()
+                
+                if post.userId != userId {
+                    _ = try? await supabase.from("notifications").insert([
+                        "type": "like",
+                        "sender_id": userId,
+                        "receiver_id": post.userId,
+                        "post_id": post.id
+                    ]).execute()
+                }
+            }
+            
+            do {
+                try await supabase.from("posts")
+                    .update(["likes_count": posts[index].likesCount])
+                    .eq("id", value: post.id)
+                    .execute()
+            } catch {
+                print("Count update failed: \(error)")
+            }
+            
+        } catch {
+            posts[index].isLiked = wasLiked
+            posts[index].likesCount = previousCount
+            print("Like toggle failed: \(error)")
+        }
+    }
+}
+
+class NotificationViewModel: ObservableObject {
+    @Published var notifications: [NotificationRecord] = []
+    @Published var loading = false
+    @Published var hasUnread = false
+    
+    @MainActor
+    func fetchNotifications(userId: String) async {
+        loading = true
+        do {
+            let response: [NotificationRecord] = try await supabase
+                .from("notifications")
+                .select("*, profiles!sender_id(*)")
+                .eq("receiver_id", value: userId)
+                .order("created_at", ascending: false)
+                .execute()
+                .value
+            self.notifications = response
+            self.hasUnread = response.contains(where: { !$0.isRead })
+        } catch {
+            print("Notifications Fetch Error: \(error)")
+        }
+        loading = false
+    }
+    
+    @MainActor
+    func markAllAsRead(userId: String) async {
+        self.hasUnread = false
+        
+        do {
+            try await supabase
+                .from("notifications")
+                .update(["is_read": true])
+                .eq("receiver_id", value: userId)
+                .eq("is_read", value: false)
+                .execute()
+            
+            for i in 0..<notifications.count {
+                notifications[i].isRead = true
+            }
+        } catch {
+            print("Mark as Read Error: \(error)")
+            self.hasUnread = notifications.contains(where: { !$0.isRead })
+        }
+    }
+}
+
+class ProfileViewModel: ObservableObject {
+    @Published var profile: Profile?
+    @Published var loading = false
+    @Published var followingCount = 0
+    @Published var followerCount = 0
+    @Published var uploadErrorMessage: String?
+    
+    @MainActor
+    func fetchProfile(userId: String) async {
+        loading = true
+        do {
+            let response: [Profile] = try await supabase.from("profiles").select().eq("id", value: userId).execute().value
+            self.profile = response.first
+            let followingRes = try await supabase.from("follows").select("*", head: true, count: .exact).eq("follower_id", value: userId).execute()
+            let followerRes = try await supabase.from("follows").select("*", head: true, count: .exact).eq("following_id", value: userId).execute()
+            self.followingCount = followingRes.count ?? 0
+            self.followerCount = followerRes.count ?? 0
+        } catch {
+            print("Profile Fetch Error: \(error)")
+        }
+        loading = false
+    }
+    
+    @MainActor
+    func updateProfile(userId: String, username: String, bio: String, avatarUrl: String?) async {
+        loading = true
+        do {
+            let updatedProfile = Profile(userId: userId, username: username, avatarUrl: avatarUrl, bio: bio)
+            try await supabase.from("profiles").upsert(updatedProfile).execute()
+            self.profile = updatedProfile
+        } catch {
+            print("Profile Update Error: \(error)")
+        }
+        loading = false
+    }
+    
+    @MainActor
+    func uploadAvatar(userId: String, data: Data) async -> String? {
+        loading = true
+        uploadErrorMessage = nil
+        do {
+            let fileName = "\(userId)_avatar.jpg"
+            let options = FileOptions(contentType: "image/jpeg", upsert: true)
+            try await supabase.storage.from("avatars").upload(fileName, data: data, options: options)
+            let publicURL = try supabase.storage.from("avatars").getPublicURL(path: fileName)
+            loading = false
+            return publicURL.absoluteString
+        } catch {
+            self.uploadErrorMessage = error.localizedDescription
+            loading = false
+            return nil
+        }
+    }
+}
+
+class RecordViewModel: ObservableObject {
+    enum RecordState { case idle, recording, reviewing, success }
+    @Published var state: RecordState = .idle
+    @Published var isUploading = false
+    @Published var recordingDuration: TimeInterval = 0
+    @Published var isPreviewPlaying = false
+    @Published var previewProgress: Double = 0
+    @Published var previewDuration: Double = 0
+    
+    private let maxDuration: TimeInterval = 300.0
+    private var audioRecorder: AVAudioRecorder?
+    private var audioPlayer: AVAudioPlayer?
+    private var timer: Timer?
+    private var previewTimer: Timer?
+    private var audioFileURL: URL?
+    
+    func startRecording() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .default, options: .defaultToSpeaker)
+            try session.setActive(true)
+            let fileName = "recording-\(UUID().uuidString).m4a"
+            audioFileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+            let settings: [String: Any] = [
+                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            ]
+            audioRecorder = try AVAudioRecorder(url: audioFileURL!, settings: settings)
+            audioRecorder?.prepareToRecord()
+            audioRecorder?.record()
+            state = .recording
+            startTimer()
+        } catch {
+            print("Recording Error: \(error)")
+        }
+    }
+    
+    func stopRecording() {
+        audioRecorder?.stop()
+        stopTimer()
+        state = .reviewing
+        if let url = audioFileURL {
+            do {
+                let player = try AVAudioPlayer(contentsOf: url)
+                previewDuration = player.duration
+            } catch {
+                print("Error loading preview duration: \(error)")
+            }
+        }
+        try? AVAudioSession.sharedInstance().setActive(false)
+    }
+    
+    func playPreview() {
+        guard let url = audioFileURL else { return }
+        if let player = audioPlayer, isPreviewPlaying {
+            player.pause()
+            isPreviewPlaying = false
+            stopPreviewTimer()
+        } else {
+            do {
+                if audioPlayer == nil {
+                    audioPlayer = try AVAudioPlayer(contentsOf: url)
+                    audioPlayer?.prepareToPlay()
+                }
+                audioPlayer?.play()
+                isPreviewPlaying = true
+                startPreviewTimer()
+            } catch {
+                print("Playback Error: \(error)")
+            }
+        }
+    }
+    
+    func seekPreview(to time: Double) {
+        audioPlayer?.currentTime = time
+        previewProgress = time
+    }
+    
+    private func startPreviewTimer() {
+        previewTimer?.invalidate()
+        previewTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self, let player = self.audioPlayer else { return }
+            self.previewProgress = player.currentTime
+            if !player.isPlaying {
+                self.isPreviewPlaying = false
+                self.stopPreviewTimer()
+                if player.currentTime >= player.duration - 0.2 {
+                    self.previewProgress = 0
+                    player.currentTime = 0
+                }
+            }
+        }
+    }
+    
+    private func stopPreviewTimer() {
+        previewTimer?.invalidate()
+        previewTimer = nil
+    }
+    
+    func reset() {
+        audioPlayer?.stop()
+        stopPreviewTimer()
+        audioPlayer = nil
+        isPreviewPlaying = false
+        state = .idle
+        recordingDuration = 0
+        previewProgress = 0
+    }
+    
+    private func startTimer() {
+        recordingDuration = 0
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.recordingDuration += 1.0
+            if let duration = self?.recordingDuration, let maxD = self?.maxDuration, duration >= maxD {
+                self?.stopRecording()
+            }
+        }
+    }
+    
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+    
+    @MainActor
+    func uploadAndPost(title: String, userId: String) async -> Bool {
+        guard let fileURL = audioFileURL else { return false }
+        isUploading = true
+        defer {
+            isUploading = false
+        }
+        do {
+            let fileName = "\(UUID().uuidString).m4a"
+            try await supabase.storage.from("voice-memos").upload(fileName, data: try Data(contentsOf: fileURL))
+            let publicURL = try supabase.storage.from("voice-memos").getPublicURL(path: fileName)
+            let newPost = PostInsertData(title: title, audio_url: publicURL.absoluteString, user_id: userId, likes_count: 0)
+            try await supabase.from("posts").insert(newPost).execute()
+            return true
+        } catch {
+            print("Upload Error: \(error)")
+            return false
+        }
+    }
+    
+    func formatTime(_ time: Double) -> String {
+        let minutes = Int(time) / 60
+        let seconds = Int(time) % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+@MainActor
+class SearchViewModel: ObservableObject {
+    @Published var searchResults: [Profile] = []
+    @Published var loading = false
+    
+    func searchUsers(query: String) async {
+        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
+            self.searchResults = []
+            return
+        }
+        loading = true
+        do {
+            let results: [Profile] = try await supabase.from("profiles")
+                .select()
+                .ilike("username", pattern: "%\(query)%")
+                .execute()
+                .value
+            self.searchResults = results
+        } catch {
+            print("Search Error: \(error)")
+        }
+        loading = false
+    }
+}
+
+// MARK: - Views
+
+struct MainTabView: View {
+    @ObservedObject var authViewModel: AuthViewModel
+    @StateObject var homeViewModel = HomeViewModel()
+    @StateObject var profileViewModel = ProfileViewModel()
+    @StateObject var notificationViewModel = NotificationViewModel()
+    @State private var selectedTab = 0
+    
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            TabView(selection: $selectedTab) {
+                HomeView(homeViewModel: homeViewModel, authViewModel: authViewModel, profileViewModel: profileViewModel)
+                    .tabItem {
+                        Label("Home", systemImage: "play.house.fill")
+                    }
+                    .tag(0)
+                
+                SearchView(authViewModel: authViewModel, homeViewModel: homeViewModel)
+                    .tabItem {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    .tag(1)
+                
+                Color.clear
+                    .tabItem {
+                        Label("", systemImage: "")
+                    }
+                    .tag(2)
+                
+                NotificationsView(viewModel: notificationViewModel, authViewModel: authViewModel, homeViewModel: homeViewModel)
+                    .tabItem {
+                        Label("Notifications", systemImage: "heart.fill")
+                    }
+                    .tag(3)
+                
+                ProfileTabView(authViewModel: authViewModel, profileViewModel: profileViewModel, homeViewModel: homeViewModel)
+                    .tabItem {
+                        Label("Profile", systemImage: "person")
+                    }
+                    .tag(4)
+            }
+            .environment(\.imageScale, .small)
+            .tint(Color(red: 0.83, green: 0.99, blue: 0.24))
+            .onChange(of: selectedTab) { _, newTab in
+                if newTab == 3, let uid = authViewModel.session?.user.id.uuidString {
+                    Task {
+                        await notificationViewModel.markAllAsRead(userId: uid)
+                    }
+                }
+            }
+            
+            .overlay(
+                VStack {
+                    Spacer()
+                    if notificationViewModel.hasUnread && selectedTab != 3 {
+                        HStack(spacing: 0) {
+                            Color.clear.frame(maxWidth: .infinity)
+                            Color.clear.frame(maxWidth: .infinity)
+                            Color.clear.frame(maxWidth: .infinity)
+                            
+                            ZStack {
+                                Circle()
+                                    .fill(.red)
+                                    .frame(width: 8, height: 8)
+                                    .overlay(
+                                        Circle()
+                                            .stroke(Color(red: 0.1, green: 0.12, blue: 0.15), lineWidth: 1.5)
+                                    )
+                                    .offset(x: 10, y: -10)
+                            }
+                            .frame(maxWidth: .infinity)
+                            
+                            Color.clear.frame(maxWidth: .infinity)
+                        }
+                        .frame(height: 50)
+                    }
+                }
+                .allowsHitTesting(false)
+                .ignoresSafeArea(.keyboard, edges: .bottom)
+            )
+            
+            VStack {
+                Spacer()
+                Button(action: {
+                    selectedTab = 2
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(Color(red: 0.83, green: 0.99, blue: 0.24))
+                            .frame(width: 64, height: 64)
+                            .shadow(color: .black.opacity(0.3), radius: 8, x: 0, y: 4)
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundColor(.black)
+                    }
+                }
+                .offset(y: -5)
+                .allowsHitTesting(selectedTab != 2)
+            }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
+            
+            if selectedTab == 2 {
+                if let user = authViewModel.session?.user {
+                    RecordView(userId: user.id.uuidString) {
+                        Task {
+                            await homeViewModel.fetchPosts(currentUserId: user.id.uuidString)
+                        }
+                        selectedTab = 0
+                    }
+                    .transition(.move(edge: .bottom))
+                    .zIndex(1)
+                }
+            }
+        }
+        .onAppear {
+            let appearance = UITabBarAppearance()
+            appearance.configureWithOpaqueBackground()
+            appearance.backgroundColor = UIColor(red: 0.1, green: 0.12, blue: 0.15, alpha: 1.0)
+            
+            UITabBar.appearance().standardAppearance = appearance
+            UITabBar.appearance().scrollEdgeAppearance = appearance
+            
+            let navAppearance = UINavigationBarAppearance()
+            navAppearance.configureWithOpaqueBackground()
+            navAppearance.backgroundColor = UIColor(red: 0.1, green: 0.12, blue: 0.15, alpha: 1.0)
+            navAppearance.titleTextAttributes = [.foregroundColor: UIColor.white]
+            navAppearance.largeTitleTextAttributes = [.foregroundColor: UIColor.white]
+            
+            UINavigationBar.appearance().standardAppearance = navAppearance
+            UINavigationBar.appearance().scrollEdgeAppearance = navAppearance
+            UINavigationBar.appearance().compactAppearance = navAppearance
+            
+            if let uid = authViewModel.session?.user.id.uuidString {
+                Task {
+                    await notificationViewModel.fetchNotifications(userId: uid)
+                }
+            }
+        }
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var homeViewModel: HomeViewModel
+    @ObservedObject var authViewModel: AuthViewModel
+    @ObservedObject var profileViewModel: ProfileViewModel
+    
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .top) {
+                Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea()
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("stew")
+                            .font(.custom("Unbounded-SemiBold", size: 28))
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .padding()
+                    .background(Color(red: 0.1, green: 0.12, blue: 0.15))
+                    
+                    if let error = homeViewModel.errorMessage {
+                        VStack(spacing: 16) {
+                            Text(error)
+                                .foregroundColor(.red)
+                                .multilineTextAlignment(.center)
+                                .padding()
+                            Button("Retry") {
+                                refreshContent()
+                            }
+                            .foregroundColor(.white)
+                        }
+                    } else if homeViewModel.loading && homeViewModel.posts.isEmpty {
+                        ProgressView().tint(.white).padding(.top, 40)
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 16) {
+                                if homeViewModel.posts.isEmpty && !homeViewModel.loading {
+                                    VStack(spacing: 20) {
+                                        Image(systemName: "person.2.badge.plus.fill")
+                                            .font(.system(size: 60))
+                                            .foregroundColor(.gray)
+                                        Text("No posts to show.")
+                                            .font(.headline)
+                                            .foregroundColor(.white)
+                                        Text("Follow your friends or creators to see their voices here!")
+                                            .font(.subheadline)
+                                            .foregroundColor(.gray)
+                                            .multilineTextAlignment(.center)
+                                            .padding(.horizontal)
+                                    }
+                                    .padding(.top, 100)
+                                } else {
+                                    ForEach(homeViewModel.posts) { post in
+                                        PostCard(
+                                            post: post,
+                                            homeViewModel: homeViewModel,
+                                            currentUserId: authViewModel.session?.user.id.uuidString,
+                                            onPlay: {
+                                                homeViewModel.handlePlay(post: post)
+                                            },
+                                            onLike: {
+                                                if let uid = authViewModel.session?.user.id.uuidString {
+                                                    Task {
+                                                        await homeViewModel.toggleLike(post: post, userId: uid)
+                                                    }
+                                                }
+                                            },
+                                            onDelete: {
+                                                Task {
+                                                    await homeViewModel.deletePost(post: post)
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            .padding()
+                        }
+                        .refreshable {
+                            if let user = authViewModel.session?.user {
+                                await homeViewModel.fetchPosts(currentUserId: user.id.uuidString)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationDestination(for: String.self) { userId in
+                UserProfileView(userId: userId, authViewModel: authViewModel, homeViewModel: homeViewModel)
+            }
+            .onAppear {
+                refreshContent()
+            }
+            .onChange(of: authViewModel.session) { _, _ in
+                refreshContent()
+            }
+        }
+    }
+    
+    private func refreshContent() {
+        if let user = authViewModel.session?.user {
+            Task {
+                await profileViewModel.fetchProfile(userId: user.id.uuidString)
+                await homeViewModel.fetchPosts(currentUserId: user.id.uuidString)
+            }
+        }
+    }
+}
+
+struct SearchView: View {
+    @ObservedObject var authViewModel: AuthViewModel
+    @ObservedObject var homeViewModel: HomeViewModel
+    @StateObject private var viewModel = SearchViewModel()
+    @State private var searchText = ""
+    
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .top) {
+                Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea()
+                VStack {
+                    if viewModel.loading {
+                        ProgressView().tint(.white).padding()
+                    }
+                    if searchText.isEmpty {
+                        VStack(spacing: 20) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 60))
+                                .foregroundColor(.gray)
+                            Text("Find people on stew")
+                                .foregroundColor(.gray)
+                        }
+                        .padding(.top, 100)
+                    } else if viewModel.searchResults.isEmpty && !viewModel.loading {
+                        Text("No users found for \"\(searchText)\"")
+                            .foregroundColor(.gray)
+                            .padding(.top, 100)
+                    } else {
+                        List(viewModel.searchResults) { profile in
+                            NavigationLink(value: profile.userId) {
+                                HStack(spacing: 12) {
+                                    if let urlString = profile.avatarUrl, let url = URL(string: urlString) {
+                                        AsyncImage(url: url) { phase in
+                                            phase.image?.resizable().scaledToFill()
+                                        }
+                                        .frame(width: 50, height: 50)
+                                        .clipShape(Circle())
+                                    } else {
+                                        Circle()
+                                            .fill(Color.gray.opacity(0.3))
+                                            .frame(width: 50, height: 50)
+                                            .overlay(Image(systemName: "person.fill").foregroundColor(.white))
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(profile.username)
+                                            .fontWeight(.bold)
+                                            .foregroundColor(.white)
+                                        if let bio = profile.bio, !bio.isEmpty {
+                                            Text(bio)
+                                                .font(.caption)
+                                                .foregroundColor(.gray)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .listRowBackground(Color.clear)
+                            .listRowSeparatorTint(.gray.opacity(0.3))
+                        }
+                        .listStyle(.plain)
+                    }
+                    Spacer()
+                }
+            }
+            .navigationTitle("Search")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(red: 0.1, green: 0.12, blue: 0.15), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .searchable(text: $searchText, prompt: "Search users")
+            .onChange(of: searchText) { _, newValue in
+                Task {
+                    await viewModel.searchUsers(query: newValue)
+                }
+            }
+            .navigationDestination(for: String.self) { userId in
+                UserProfileView(userId: userId, authViewModel: authViewModel, homeViewModel: homeViewModel)
+            }
+        }
+    }
+}
+
+struct NotificationsView: View {
+    @ObservedObject var viewModel: NotificationViewModel
+    @ObservedObject var authViewModel: AuthViewModel
+    @ObservedObject var homeViewModel: HomeViewModel
+    
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .top) {
+                Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea()
+                if viewModel.loading && viewModel.notifications.isEmpty {
+                    ProgressView().tint(.white).padding(.top, 40)
+                } else if viewModel.notifications.isEmpty {
+                    VStack(spacing: 20) {
+                        Image(systemName: "bell.slash")
+                            .font(.system(size: 60))
+                            .foregroundColor(.gray)
+                        Text("No notifications yet")
+                            .foregroundColor(.gray)
+                    }
+                    .padding(.top, 100)
+                } else {
+                    List(viewModel.notifications) { notification in
+                        NotificationRow(notification: notification, homeViewModel: homeViewModel, currentUserId: authViewModel.session?.user.id.uuidString)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparatorTint(.gray.opacity(0.3))
+                    }
+                    .listStyle(.plain)
+                    .refreshable {
+                        if let uid = authViewModel.session?.user.id.uuidString {
+                            await viewModel.fetchNotifications(userId: uid)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Notifications")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(red: 0.1, green: 0.12, blue: 0.15), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .navigationDestination(for: String.self) { userId in
+                UserProfileView(userId: userId, authViewModel: authViewModel, homeViewModel: homeViewModel)
+            }
+            .onAppear {
+                if let uid = authViewModel.session?.user.id.uuidString {
+                    Task {
+                        // 表示された瞬間に既読処理を呼び出す
+                        await viewModel.markAllAsRead(userId: uid)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct NotificationRow: View {
+    let notification: NotificationRecord
+    @ObservedObject var homeViewModel: HomeViewModel
+    let currentUserId: String?
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            NavigationLink(value: notification.senderId) {
+                HStack(spacing: 12) {
+                    if let avatar = notification.sender?.avatarUrl, let url = URL(string: avatar) {
+                        AsyncImage(url: url) { phase in
+                            phase.image?.resizable().scaledToFill()
+                        }
+                        .frame(width: 44, height: 44)
+                        .clipShape(Circle())
+                    } else {
+                        Circle()
+                            .fill(Color.gray.opacity(0.3))
+                            .frame(width: 44, height: 44)
+                            .overlay(Image(systemName: "person.fill").foregroundColor(.white))
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Text(notification.sender?.username ?? "Someone")
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            Text(notification.type == "like" ? "liked your post" : "followed you")
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                        .font(.subheadline)
+                        
+                        Text(notification.createdAt.timeAgo())
+                            .font(.caption2)
+                            .foregroundColor(.gray)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            
+            Spacer()
+            
+            if notification.type == "like" {
+                Image(systemName: "heart.fill").foregroundColor(.red)
+            } else if let currentId = currentUserId {
+                let isFollowing = homeViewModel.followingIds.contains(notification.senderId)
+                Button(action: {
+                    Task {
+                        await homeViewModel.toggleFollow(targetUserId: notification.senderId, currentUserId: currentId)
+                    }
+                }) {
+                    Text(isFollowing ? "Following" : "Follow back")
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(isFollowing ? Color.gray.opacity(0.3) : Color(red: 0.83, green: 0.99, blue: 0.24))
+                        .foregroundColor(isFollowing ? .white : .black)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+struct UserProfileView: View {
+    let userId: String
+    @ObservedObject var authViewModel: AuthViewModel
+    @ObservedObject var homeViewModel: HomeViewModel
+    @StateObject private var profileViewModel = ProfileViewModel()
+    @State private var showBlockAlert = false
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                VStack(spacing: 20) {
+                    if let urlString = profileViewModel.profile?.avatarUrl, let url = URL(string: urlString) {
+                        AsyncImage(url: url) { phase in
+                            phase.image?.resizable().scaledToFill()
+                        }
+                        .frame(width: 100, height: 100)
+                        .clipShape(Circle())
+                    } else {
+                        Circle()
+                            .fill(Color.gray.opacity(0.3))
+                            .frame(width: 100, height: 100)
+                            .overlay(Image(systemName: "person.fill").font(.system(size: 40)).foregroundColor(.white))
+                    }
+                    VStack(spacing: 8) {
+                        Text(profileViewModel.profile?.username ?? "User")
+                            .font(.title2)
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                        if let bio = profileViewModel.profile?.bio, !bio.isEmpty {
+                            Text(bio)
+                                .font(.body)
+                                .foregroundColor(.gray)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        }
+                    }
+                    HStack(spacing: 40) {
+                        VStack {
+                            Text("\(profileViewModel.followingCount)")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                            Text("Following")
+                                .font(.caption)
+                                .foregroundColor(.gray)
+                        }
+                        VStack {
+                            Text("\(profileViewModel.followerCount)")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                            Text("Followers")
+                                .font(.caption)
+                                .foregroundColor(.gray)
+                        }
+                    }
+                    if let currentId = authViewModel.session?.user.id.uuidString, userId.lowercased() != currentId.lowercased() {
+                        let isFollowing = homeViewModel.followingIds.contains(userId)
+                        Button(action: {
+                            Task {
+                                await homeViewModel.toggleFollow(targetUserId: userId, currentUserId: currentId)
+                                await profileViewModel.fetchProfile(userId: userId)
+                            }
+                        }) {
+                            Text(isFollowing ? "Following" : "Follow")
+                                .fontWeight(.bold)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(isFollowing ? Color.gray.opacity(0.3) : Color(red: 0.83, green: 0.99, blue: 0.24))
+                                .foregroundColor(isFollowing ? .white : .black)
+                                .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
+                    }
+                }
+                .padding(.top, 20)
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Post")
+                        .font(.title3)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal)
+                    
+                    let userPosts = homeViewModel.posts.filter { $0.userId.lowercased() == userId.lowercased() }
+                    if userPosts.isEmpty {
+                        Text("No posts yet.")
+                            .foregroundColor(.gray)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
+                    } else {
+                        LazyVStack(spacing: 16) {
+                            ForEach(userPosts) { post in
+                                PostCard(
+                                    post: post,
+                                    homeViewModel: homeViewModel,
+                                    currentUserId: authViewModel.session?.user.id.uuidString,
+                                    onPlay: {
+                                        homeViewModel.handlePlay(post: post)
+                                    },
+                                    onLike: {
+                                        if let uid = authViewModel.session?.user.id.uuidString {
+                                            Task {
+                                                await homeViewModel.toggleLike(post: post, userId: uid)
+                                            }
+                                        }
+                                    },
+                                    onDelete: {
+                                        Task {
+                                            await homeViewModel.deletePost(post: post)
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+                }
+            }
+            .padding(.vertical)
+        }
+        .background(Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea())
+        .navigationTitle(profileViewModel.profile?.username ?? "Profile")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color(red: 0.1, green: 0.12, blue: 0.15), for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
+        .toolbar {
+            if let currentId = authViewModel.session?.user.id.uuidString, userId != currentId {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button(role: .destructive, action: {
+                            showBlockAlert = true
+                        }) {
+                            Label("Block User", systemImage: "person.slash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .foregroundColor(.white)
+                    }
+                }
+            }
+        }
+        .alert("Block this user?", isPresented: $showBlockAlert) {
+            Button("Block", role: .destructive) {
+                if let currentId = authViewModel.session?.user.id.uuidString {
+                    Task {
+                        await homeViewModel.blockUser(targetUserId: userId, currentUserId: currentId)
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You will no longer see posts from this user.")
+        }
+        .task {
+            await profileViewModel.fetchProfile(userId: userId)
+        }
+    }
+}
+
+struct ProfileTabView: View {
+    @ObservedObject var authViewModel: AuthViewModel
+    @ObservedObject var profileViewModel: ProfileViewModel
+    @ObservedObject var homeViewModel: HomeViewModel
+    @State private var username: String = ""
+    @State private var bio: String = ""
+    @State private var avatarUrl: String?
+    @State private var selectedItem: PhotosPickerItem?
+    @State private var isEditing = false
+    @State private var showDeleteAccountAlert = false
+    @State private var showBlockedUsers = false
+    
+    @State private var pickedUIImage: UIImage? = nil
+    @State private var showCropper = false
+    
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 24) {
+                    VStack(spacing: 20) {
+                        if isEditing {
+                            PhotosPicker(selection: $selectedItem, matching: .images) {
+                                ZStack {
+                                    ProfileImageContainer(avatarUrl: avatarUrl)
+                                    Circle()
+                                        .fill(Color.black.opacity(0.3))
+                                        .frame(width: 32, height: 32)
+                                        .overlay(Image(systemName: "camera.fill").font(.caption).foregroundColor(.white))
+                                        .offset(x: 35, y: 35)
+                                }
+                            }
+                            .onChange(of: selectedItem) { _, newItem in
+                                Task {
+                                    guard let newItem = newItem else { return }
+                                    if let data = try? await newItem.loadTransferable(type: Data.self),
+                                       let uiImage = UIImage(data: data) {
+                                        await MainActor.run {
+                                            self.pickedUIImage = uiImage
+                                            self.showCropper = true
+                                            self.selectedItem = nil
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ProfileImageContainer(avatarUrl: avatarUrl)
+                        }
+                        
+                        if isEditing {
+                            VStack(alignment: .leading, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Username").font(.caption).foregroundColor(.gray)
+                                    TextField("Enter username", text: $username)
+                                        .padding()
+                                        .background(Color.white.opacity(0.1))
+                                        .cornerRadius(12)
+                                        .foregroundColor(.white)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Bio").font(.caption).foregroundColor(.gray)
+                                    TextEditor(text: $bio)
+                                        .frame(height: 80)
+                                        .padding(8)
+                                        .scrollContentBackground(.hidden)
+                                        .background(Color.white.opacity(0.1))
+                                        .cornerRadius(12)
+                                        .foregroundColor(.white)
+                                        .onChange(of: bio) { _, newValue in
+                                            if newValue.count > 100 {
+                                                bio = String(newValue.prefix(100))
+                                            }
+                                        }
+                                    HStack {
+                                        Spacer()
+                                        Text("\(bio.count)/100")
+                                            .font(.caption2)
+                                            .foregroundColor(bio.count == 100 ? .red : .gray)
+                                    }
+                                }
+                                Button(action: {
+                                    if let user = authViewModel.session?.user {
+                                        Task {
+                                            await profileViewModel.updateProfile(userId: user.id.uuidString, username: username, bio: bio, avatarUrl: avatarUrl)
+                                            await homeViewModel.fetchPosts(currentUserId: user.id.uuidString)
+                                            withAnimation {
+                                                isEditing = false
+                                            }
+                                        }
+                                    }
+                                }) {
+                                    Text("Save Changes")
+                                        .fontWeight(.bold)
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                        .background(Color(red: 0.83, green: 0.99, blue: 0.24))
+                                        .foregroundColor(.black)
+                                        .cornerRadius(12)
+                                }
+                            }.padding(.horizontal)
+                        } else {
+                            VStack(spacing: 8) {
+                                Text(profileViewModel.profile?.username ?? "User")
+                                    .font(.title2)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.white)
+                                if let bio = profileViewModel.profile?.bio, !bio.isEmpty {
+                                    Text(bio)
+                                        .font(.body)
+                                        .foregroundColor(.gray)
+                                        .multilineTextAlignment(.center)
+                                        .padding(.horizontal)
+                                }
+                            }
+                            HStack(spacing: 40) {
+                                VStack {
+                                    Text("\(profileViewModel.followingCount)")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    Text("Following")
+                                        .font(.caption)
+                                        .foregroundColor(.gray)
+                                }
+                                VStack {
+                                    Text("\(profileViewModel.followerCount)")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    Text("Followers")
+                                        .font(.caption)
+                                        .foregroundColor(.gray)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 20)
+                    
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Post")
+                            .font(.title3)
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal)
+                        
+                        let currentUserId = authViewModel.session?.user.id.uuidString.lowercased() ?? ""
+                        let myPosts = homeViewModel.posts.filter { $0.userId.lowercased() == currentUserId }
+                        
+                        if myPosts.isEmpty {
+                            Text("No posts yet.")
+                                .foregroundColor(.gray)
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 40)
+                        } else {
+                            LazyVStack(spacing: 16) {
+                                ForEach(myPosts) { post in
+                                    PostCard(
+                                        post: post,
+                                        homeViewModel: homeViewModel,
+                                        currentUserId: authViewModel.session?.user.id.uuidString,
+                                        onPlay: {
+                                            homeViewModel.handlePlay(post: post)
+                                        },
+                                        onLike: {
+                                            if let uid = authViewModel.session?.user.id.uuidString {
+                                                Task {
+                                                    await homeViewModel.toggleLike(post: post, userId: uid)
+                                                }
+                                            }
+                                        },
+                                        onDelete: {
+                                            Task {
+                                                await homeViewModel.deletePost(post: post)
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+                }
+                .padding(.vertical)
+            }
+            .background(Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea())
+            .navigationTitle("Profile")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(red: 0.1, green: 0.12, blue: 0.15), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button(action: {
+                            withAnimation {
+                                isEditing.toggle()
+                            }
+                        }) {
+                            Label(isEditing ? "Cancel Editing" : "Edit profile", systemImage: "pencil")
+                        }
+                        
+                        Button(action: {
+                            showBlockedUsers = true
+                        }) {
+                            Label("Blocked Users", systemImage: "person.slash")
+                        }
+                        
+                        Link(destination: URL(string: "https://grizzled-preface-8af.notion.site/Terms-of-use-2d8cbc70e029808ebafddd273e116b59?pvs=73")!) {
+                            Label("Terms of Use", systemImage: "doc.text.fill")
+                        }
+                        
+                        Link(destination: URL(string: "https://docs.google.com/document/d/e/2PACX-1vQCLhSzCm1zIUivwlp4nZRDamybgdpCEu9NGNwWBBjE6hboAeyTUSkhTHer5w5xKkgWWrfOKPLIGTxH/pub")!) {
+                            Label("Privacy Policy", systemImage: "shield.lefthalf.filled")
+                        }
+                        
+                        Button(role: .destructive, action: {
+                            Task {
+                                await authViewModel.signOut()
+                            }
+                        }) {
+                            Label("Log out", systemImage: "arrow.right.square")
+                        }
+                        
+                        Button(role: .destructive, action: {
+                            showDeleteAccountAlert = true
+                        }) {
+                            Label("Delete Account", systemImage: "person.badge.minus")
+                        }
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                            .font(.title3)
+                            .foregroundColor(.white)
+                    }
+                }
+            }
+            .navigationDestination(isPresented: $showBlockedUsers) {
+                if let uid = authViewModel.session?.user.id.uuidString {
+                    BlockedUsersView(homeViewModel: homeViewModel, currentUserId: uid)
+                }
+            }
+            .onAppear {
+                if let user = authViewModel.session?.user {
+                    Task {
+                        await profileViewModel.fetchProfile(userId: user.id.uuidString)
+                        self.username = profileViewModel.profile?.username ?? ""
+                        self.bio = profileViewModel.profile?.bio ?? ""
+                        self.avatarUrl = profileViewModel.profile?.avatarUrl
+                        await homeViewModel.fetchPosts(currentUserId: user.id.uuidString)
+                    }
+                }
+            }
+            .alert("Delete Account?", isPresented: $showDeleteAccountAlert) {
+                Button("Delete", role: .destructive) {
+                    Task {
+                        await authViewModel.deleteAccount()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will permanently delete your account and all your posts. This action cannot be undone.")
+            }
+            .fullScreenCover(isPresented: $showCropper) {
+                if let image = pickedUIImage {
+                    ImageCropperView(image: image) { croppedImage in
+                        Task {
+                            guard let userId = authViewModel.session?.user.id.uuidString else { return }
+                            if let data = croppedImage.jpegData(compressionQuality: 0.7),
+                               let url = await profileViewModel.uploadAvatar(userId: userId, data: data) {
+                                await MainActor.run {
+                                    self.avatarUrl = url
+                                }
+                                await profileViewModel.updateProfile(userId: userId, username: username, bio: bio, avatarUrl: url)
+                                await homeViewModel.fetchPosts(currentUserId: userId)
+                            }
+                            await MainActor.run {
+                                showCropper = false
+                                pickedUIImage = nil
+                            }
+                        }
+                    } onCancel: {
+                        showCropper = false
+                        pickedUIImage = nil
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Helper Views
+
+struct ProfileImageContainer: View {
+    let avatarUrl: String?
+    
+    var body: some View {
+        if let urlString = avatarUrl, let url = URL(string: urlString) {
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFill()
+                } else {
+                    ProgressView()
+                }
+            }
+            .frame(width: 100, height: 100)
+            .clipShape(Circle())
+        } else {
+            Circle()
+                .fill(Color.gray.opacity(0.3))
+                .frame(width: 100, height: 100)
+                .overlay(Image(systemName: "person.fill").font(.system(size: 40)).foregroundColor(.white))
+        }
+    }
+}
+
+struct ImageCropperView: View {
+    let image: UIImage
+    var onCrop: (UIImage) -> Void
+    var onCancel: () -> Void
+    
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+    
+    let maskSize: CGFloat = 300
+    
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .scaleEffect(scale)
+                .offset(offset)
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            offset = CGSize(
+                                width: lastOffset.width + value.translation.width,
+                                height: lastOffset.height + value.translation.height
+                            )
+                        }
+                        .onEnded { _ in
+                            lastOffset = offset
+                        }
+                )
+                .simultaneousGesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            scale = lastScale * value
+                        }
+                        .onEnded { _ in
+                            lastScale = scale
+                        }
+                )
+            
+            Color.black.opacity(0.6)
+                .reverseMask {
+                    Circle()
+                        .frame(width: maskSize, height: maskSize)
+                }
+                .allowsHitTesting(false)
+            
+            Circle()
+                .stroke(Color.white, lineWidth: 2)
+                .frame(width: maskSize, height: maskSize)
+                .allowsHitTesting(false)
+            
+            VStack {
+                HStack {
+                    Button(action: {
+                        onCancel()
+                    }) {
+                        Text("Cancel")
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.6))
+                            .clipShape(Capsule())
+                    }
+                    .foregroundColor(.white)
+                    
+                    Spacer()
+                    
+                    Button(action: {
+                        let cropped = cropImage()
+                        onCrop(cropped)
+                    }) {
+                        Text("Done")
+                            .fontWeight(.bold)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color(red: 0.83, green: 0.99, blue: 0.24).opacity(0.9))
+                            .foregroundColor(.black)
+                            .clipShape(Capsule())
+                    }
+                }
+                .padding()
+                .padding(.top, 80)
+                
+                Spacer()
+                
+                Text("Zoom and drag to adjust")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.7))
+                    .padding(.bottom, 40)
+            }
+        }
+    }
+    
+    private func cropImage() -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: maskSize, height: maskSize))
+        return renderer.image { _ in
+            let screenSize = UIScreen.main.bounds.size
+            let imageSize = image.size
+            let aspectWidth = screenSize.width / imageSize.width
+            let aspectHeight = screenSize.height / imageSize.height
+            let aspect = min(aspectWidth, aspectHeight)
+            
+            let displayWidth = imageSize.width * aspect * scale
+            let displayHeight = imageSize.height * aspect * scale
+            
+            let x = (maskSize - displayWidth) / 2 + offset.width
+            let y = (maskSize - displayHeight) / 2 + offset.height
+            
+            image.draw(in: CGRect(x: x, y: y, width: displayWidth, height: displayHeight))
+        }
+    }
+}
+
+struct BlockedUsersView: View {
+    @ObservedObject var homeViewModel: HomeViewModel
+    let currentUserId: String
+    
+    @State private var showUnblockAlert = false
+    @State private var userToUnblock: Profile? = nil
+    
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea()
+            
+            VStack {
+                if homeViewModel.blockedUsers.isEmpty {
+                    VStack(spacing: 20) {
+                        Image(systemName: "person.fill.checkmark")
+                            .font(.system(size: 60))
+                            .foregroundColor(.gray)
+                        Text("No blocked users")
+                            .foregroundColor(.gray)
+                    }
+                    .padding(.top, 100)
+                } else {
+                    List(homeViewModel.blockedUsers) { profile in
+                        HStack {
+                            if let urlString = profile.avatarUrl, let url = URL(string: urlString) {
+                                AsyncImage(url: url) { phase in
+                                    phase.image?.resizable().scaledToFill()
+                                }
+                                .frame(width: 44, height: 44)
+                                .clipShape(Circle())
+                            } else {
+                                Circle()
+                                    .fill(Color.gray.opacity(0.3))
+                                    .frame(width: 44, height: 44)
+                                    .overlay(Image(systemName: "person.fill").foregroundColor(.white))
+                            }
+                            
+                            Text(profile.username)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            
+                            Spacer()
+                            
+                            Button(action: {
+                                userToUnblock = profile
+                                showUnblockAlert = true
+                            }) {
+                                Text("Unblock")
+                                    .font(.caption)
+                                    .fontWeight(.bold)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(Color.white.opacity(0.1))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                            }
+                        }
+                        .listRowBackground(Color.clear)
+                        .listRowSeparatorTint(.gray.opacity(0.3))
+                    }
+                    .listStyle(.plain)
+                }
+                Spacer()
+            }
+        }
+        .navigationTitle("Blocked Users")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert("Unblock User?", isPresented: $showUnblockAlert) {
+            Button("Unblock", role: .destructive) {
+                if let profile = userToUnblock {
+                    Task {
+                        await homeViewModel.unblockUser(targetUserId: profile.userId, currentUserId: currentUserId)
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Are you sure you want to unblock \(userToUnblock?.username ?? "this user")?")
+        }
+        .task {
+            await homeViewModel.fetchBlockedUsers(currentUserId: currentUserId)
+        }
+    }
+}
+
+struct RecordView: View {
+    @StateObject private var recordViewModel = RecordViewModel()
+    @State private var caption: String = ""
+    @State private var showRetakeAlert = false
+    let userId: String
+    var onComplete: () -> Void
+    
+    var body: some View {
+        ZStack {
+            Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea()
+            VStack(spacing: 30) {
+                HStack {
+                    Button("Cancel") {
+                        onComplete()
+                    }
+                    .foregroundColor(.white)
+                    .disabled(recordViewModel.state == .success)
+                    Spacer()
+                    Text("Record")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    Spacer()
+                    Button("Cancel") {}.opacity(0)
+                }
+                .padding()
+                Spacer()
+                switch recordViewModel.state {
+                case .idle:
+                    Text("Speak your mind")
+                        .font(.title2)
+                        .foregroundColor(.gray)
+                    Button(action: {
+                        recordViewModel.startRecording()
+                    }) {
+                        recordCircle(color: Color(red: 0.83, green: 0.99, blue: 0.24), icon: "mic.fill")
+                    }
+                case .recording:
+                    VStack(spacing: 20) {
+                        Text("\(recordViewModel.formatTime(recordViewModel.recordingDuration)) / 5:00")
+                            .font(.system(size: 48, weight: .bold, design: .rounded).monospacedDigit())
+                            .foregroundColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                        Button(action: {
+                            recordViewModel.stopRecording()
+                        }) {
+                            recordCircle(color: .red, icon: "stop.fill")
+                        }
+                    }
+                case .reviewing:
+                    VStack(spacing: 20) {
+                        HStack(spacing: 40) {
+                            Button(action: {
+                                showRetakeAlert = true
+                            }) {
+                                Image(systemName: "arrow.counterclockwise.circle.fill")
+                                    .font(.system(size: 70))
+                                    .foregroundColor(.gray)
+                            }
+                            Button(action: {
+                                recordViewModel.playPreview()
+                            }) {
+                                Image(systemName: recordViewModel.isPreviewPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                    .font(.system(size: 70))
+                                    .foregroundColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                            }
+                        }
+                        
+                        VStack(spacing: 8) {
+                            Slider(value: Binding(get: {
+                                recordViewModel.previewProgress
+                            }, set: { newValue in
+                                recordViewModel.seekPreview(to: newValue)
+                            }), in: 0...max(recordViewModel.previewDuration, 1))
+                            .accentColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                            
+                            HStack {
+                                Text(recordViewModel.formatTime(recordViewModel.previewProgress))
+                                Spacer()
+                                Text(recordViewModel.formatTime(recordViewModel.previewDuration))
+                            }
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundColor(.gray)
+                        }
+                        .padding(.horizontal, 30)
+                        
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Short caption (Optional)")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.8))
+                            TextField(text: $caption, prompt: Text("Something to add...").foregroundColor(.white.opacity(0.6))) {}
+                                .padding()
+                                .background(Color.white.opacity(0.1))
+                                .cornerRadius(12)
+                                .foregroundColor(.white)
+                                .onChange(of: caption) { _, newValue in
+                                    var totalWidth = 0
+                                    var truncatedString = ""
+                                    for char in newValue {
+                                        let width = char.isASCII ? 1 : 2
+                                        if totalWidth + width <= 40 {
+                                            truncatedString.append(char)
+                                            totalWidth += width
+                                        } else {
+                                            break
+                                        }
+                                    }
+                                    if caption != truncatedString {
+                                        caption = truncatedString
+                                    }
+                                }
+                        }
+                        .padding(.horizontal)
+                        
+                        Button(action: {
+                            Task {
+                                let success = await recordViewModel.uploadAndPost(title: caption, userId: userId)
+                                if success {
+                                    withAnimation(.spring()) {
+                                        recordViewModel.state = .success
+                                    }
+                                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                    onComplete()
+                                }
+                            }
+                        }) {
+                            if recordViewModel.isUploading {
+                                ProgressView().tint(.black)
+                            } else {
+                                Text("Post Now")
+                                    .fontWeight(.bold)
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                    .background(Color(red: 0.83, green: 0.99, blue: 0.24))
+                                    .foregroundColor(.black)
+                                    .cornerRadius(12)
+                            }
+                        }
+                        .padding(.horizontal)
+                        .disabled(recordViewModel.isUploading)
+                    }
+                case .success:
+                    VStack(spacing: 20) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 100))
+                            .foregroundColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                            .transition(.scale.combined(with: .opacity))
+                        
+                        Text("Posted!")
+                            .font(.title)
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                    }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                Spacer()
+            }
+        }
+        .alert("Retake Recording?", isPresented: $showRetakeAlert) {
+            Button("Retake", role: .destructive) {
+                recordViewModel.reset()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your current recording will be deleted and you can start over.")
+        }
+    }
+    
+    private func recordCircle(color: Color, icon: String) -> some View {
+        ZStack {
+            Circle()
+                .fill(color)
+                .frame(width: 100, height: 100)
+            Image(systemName: icon)
+                .font(.system(size: 40))
+                .foregroundColor(.black)
+        }
+    }
+}
+
+struct PostCard: View {
+    let post: Post
+    @ObservedObject var homeViewModel: HomeViewModel
+    let currentUserId: String?
+    let onPlay: () -> Void
+    let onLike: () -> Void
+    let onDelete: () -> Void
+    
+    @State private var showDeleteAlert = false
+    @State private var showBlockAlert = false
+    @State private var showReportAlert = false
+    @State private var showReportFeedback = false
+    
+    private func formatTime(_ time: Double) -> String {
+        if time.isNaN {
+            return "0:00"
+        }
+        let minutes = Int(time) / 60
+        let seconds = Int(time) % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+    
+    var body: some View {
+        let progress = homeViewModel.playerProgress[post.id] ?? 0
+        let duration = homeViewModel.playerDurations[post.id] ?? 0
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                NavigationLink(value: post.userId) {
+                    HStack(spacing: 12) {
+                        if let urlString = post.author?.avatarUrl, let url = URL(string: urlString) {
+                            AsyncImage(url: url) { phase in
+                                if let image = phase.image {
+                                    image.resizable().scaledToFill()
+                                } else {
+                                    Circle().fill(Color.gray)
+                                }
+                            }
+                            .frame(width: 40, height: 40)
+                            .clipShape(Circle())
+                        } else {
+                            Circle()
+                                .fill(Color.gray)
+                                .frame(width: 40, height: 40)
+                                .overlay(
+                                    Text((post.author?.username ?? "?").prefix(1).uppercased())
+                                        .foregroundColor(.white)
+                                )
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(post.author?.username ?? "Unknown")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.white)
+                            Text(post.createdAt.timeAgo())
+                                .font(.caption2)
+                                .foregroundColor(.gray)
+                        }
+                        Spacer()
+                        if let currentId = currentUserId {
+                            Menu {
+                                if post.userId.lowercased() == currentId.lowercased() {
+                                    Button(role: .destructive, action: {
+                                        showDeleteAlert = true
+                                    }) {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                } else {
+                                    Button(action: {
+                                        showReportAlert = true
+                                    }) {
+                                        Label("Report Content", systemImage: "flag")
+                                    }
+                                    Button(role: .destructive, action: {
+                                        showBlockAlert = true
+                                    }) {
+                                        Label("Block User", systemImage: "person.slash")
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .foregroundColor(.gray)
+                                    .padding(8)
+                                    .contentShape(Rectangle())
+                            }
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                
+                if let title = post.title, !title.isEmpty {
+                    Text(title)
+                        .font(.body)
+                        .foregroundColor(.white)
+                        .lineSpacing(4)
+                }
+                
+                HStack {
+                    Button(action: onPlay) {
+                        Image(systemName: (homeViewModel.currentlyPlayingId == post.id && homeViewModel.isPlayerPlaying) ? "pause.circle.fill" : "play.circle.fill")
+                            .resizable()
+                            .frame(width: 44, height: 44)
+                            .foregroundColor(.white)
+                    }
+                    if duration > 0 {
+                        HStack(spacing: 8) {
+                            if progress > 0 {
+                                Text(formatTime(progress))
+                                    .font(.caption2)
+                                    .monospacedDigit()
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                            Spacer()
+                            Text(formatTime(duration))
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                        .padding(.horizontal, 4)
+                    }
+                    Spacer()
+                    ShareLink(
+                        item: post.audioUrl,
+                        subject: Text("Check out this stew post"),
+                        message: Text(post.title ?? "")
+                    ) {
+                        Image(systemName: "square.and.arrow.up")
+                            .foregroundColor(.gray)
+                    }
+                    .padding(.trailing, 8)
+                    Button(action: onLike) {
+                        HStack(spacing: 6) {
+                            Image(systemName: post.isLiked ? "heart.fill" : "heart")
+                            Text("\(post.likesCount)")
+                        }
+                        .foregroundColor(post.isLiked ? .red : .gray)
+                    }
+                }
+            }
+            .padding(16)
+            if duration > 0 {
+                ProgressView(value: progress, total: max(duration, 1))
+                    .tint(Color(red: 0.83, green: 0.99, blue: 0.24))
+                    .scaleEffect(x: 1, y: 1.0, anchor: .bottom)
+                    .frame(height: 3)
+            }
+        }
+        .background(Color(red: 0.15, green: 0.17, blue: 0.2))
+        .cornerRadius(16)
+        .clipped()
+        .alert("Delete post?", isPresented: $showDeleteAlert) {
+            Button("Delete", role: .destructive) {
+                onDelete()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This action cannot be undone. Are you sure you want to delete this post?")
+        }
+        .alert("Report this post?", isPresented: $showReportAlert) {
+            Button("Report", role: .destructive) {
+                if let currentId = currentUserId {
+                    Task {
+                        await homeViewModel.reportPost(postId: post.id, currentUserId: currentId)
+                        showReportFeedback = true
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("We will review this content for safety violations within 24 hours.")
+        }
+        .alert("Block this user?", isPresented: $showBlockAlert) {
+            Button("Block", role: .destructive) {
+                if let currentId = currentUserId {
+                    Task {
+                        await homeViewModel.blockUser(targetUserId: post.userId, currentUserId: currentId)
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You will no longer see posts from this user.")
+        }
+        .alert("Thank you", isPresented: $showReportFeedback) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Your report has been submitted for review.")
+        }
+    }
+}
+
+struct AuthView: View {
+    @ObservedObject var viewModel: AuthViewModel
+    @State private var email = ""
+    @State private var password = ""
+    @State private var username = ""
+    @State private var isSignUp = false
+    @State private var isPasswordVisible = false
+    @State private var isForgotPassword = false
+    
+    enum Field: Hashable {
+        case username, email, password
+    }
+    @FocusState private var focusedField: Field?
+    
+    private var isEmailValid: Bool {
+        let emailRegex = "[A-Z0-9a-z._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,64}"
+        let emailPredicate = NSPredicate(format: "SELF MATCHES %@", emailRegex)
+        return emailPredicate.evaluate(with: email)
+    }
+    
+    private var isPasswordValid: Bool {
+        return password.count >= 6
+    }
+    
+    private var isUsernameValid: Bool {
+        return !username.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+    
+    private var isFormValid: Bool {
+        if viewModel.isUpdatingPassword {
+            return isPasswordValid
+        } else if isForgotPassword {
+            return isEmailValid
+        } else if isSignUp {
+            return isEmailValid && isPasswordValid && isUsernameValid
+        } else {
+            return !email.isEmpty && !password.isEmpty
+        }
+    }
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                Spacer().frame(height: 60)
+                
+                Text("stew")
+                    .font(.custom("Unbounded-SemiBold", size: 64))
+                    .foregroundColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                
+                if (viewModel.verificationEmailSent || viewModel.resetEmailSent) && !viewModel.isUpdatingPassword {
+                    VStack(spacing: 30) {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 80))
+                            .foregroundColor(Color(red: 0.83, green: 0.99, blue: 0.24))
+                            .padding()
+                        
+                        VStack(spacing: 12) {
+                            Text(viewModel.resetEmailSent ? "Check your email" : "Confirm your email")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            
+                            Text("We've sent a link to \(email).")
+                                .foregroundColor(.white.opacity(0.8))
+                                .multilineTextAlignment(.center)
+                            
+                            Text(viewModel.resetEmailSent ? "Please follow the instructions in the email to reset your password." : "Please check your inbox and click the link to activate your stew account.")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        }
+                        
+                        Button(action: {
+                            viewModel.resetVerificationState()
+                            isSignUp = false
+                            isForgotPassword = false
+                        }) {
+                            Text("Back to Sign In")
+                                .fontWeight(.bold)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.white.opacity(0.1))
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                        .padding(.top, 20)
+                    }
+                    .transition(.asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
+                } else if viewModel.isUpdatingPassword {
+                    VStack(spacing: 20) {
+                        VStack(spacing: 12) {
+                            Text("New Password")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            
+                            Text("Set a strong password for your stew account.")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            ZStack(alignment: .trailing) {
+                                Group {
+                                    if isPasswordVisible {
+                                        TextField(text: $password, prompt: Text("Enter new password").foregroundColor(.white.opacity(0.6))) {}
+                                    } else {
+                                        SecureField(text: $password, prompt: Text("Enter new password").foregroundColor(.white.opacity(0.6))) {}
+                                    }
+                                }
+                                .padding()
+                                .background(Color.white.opacity(0.15))
+                                .cornerRadius(12)
+                                .foregroundColor(.white)
+                                .focused($focusedField, equals: .password)
+                                
+                                Button(action: { isPasswordVisible.toggle() }) {
+                                    Image(systemName: isPasswordVisible ? "eye.slash.fill" : "eye.fill")
+                                        .foregroundColor(.gray)
+                                        .padding(.trailing, 12)
+                                }
+                            }
+                            
+                            if !password.isEmpty && !isPasswordValid {
+                                Text("Password must be at least 6 characters")
+                                    .font(.caption2)
+                                    .foregroundColor(.red)
+                                    .padding(.leading, 4)
+                            }
+                        }
+                        
+                        Button(action: {
+                            Task {
+                                await viewModel.updatePassword(newPassword: password)
+                            }
+                        }) {
+                            HStack {
+                                if viewModel.loading {
+                                    ProgressView().tint(.black)
+                                } else {
+                                    Text("Update Password")
+                                        .fontWeight(.bold)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(isPasswordValid ? Color(red: 0.83, green: 0.99, blue: 0.24) : Color.gray.opacity(0.3))
+                            .foregroundColor(isPasswordValid ? .black : .white.opacity(0.6))
+                            .cornerRadius(12)
+                        }
+                        .disabled(!isPasswordValid || viewModel.loading)
+                        
+                        Button(action: {
+                            viewModel.isUpdatingPassword = false
+                        }) {
+                            Text("Cancel")
+                                .foregroundColor(.gray)
+                        }
+                    }
+                    .padding(.horizontal)
+                } else if isForgotPassword {
+                    VStack(spacing: 20) {
+                        VStack(spacing: 12) {
+                            Text("Reset Password")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            
+                            Text("Please enter your registered email address. We'll send you a link to reset your password.")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        }
+                        .padding(.bottom, 10)
+                        
+                        TextField(text: $email, prompt: Text("Email").foregroundColor(.white.opacity(0.6))) {}
+                            .padding()
+                            .background(Color.white.opacity(0.15))
+                            .cornerRadius(12)
+                            .foregroundColor(.white)
+                            .keyboardType(.emailAddress)
+                            .focused($focusedField, equals: .email)
+                        
+                        if !email.isEmpty && !isEmailValid {
+                            Text("Please enter a valid email address")
+                                .font(.caption2)
+                                .foregroundColor(.red)
+                        }
+                        
+                        Button(action: {
+                            Task {
+                                focusedField = nil
+                                await viewModel.sendPasswordResetEmail(email: email)
+                            }
+                        }) {
+                            HStack {
+                                if viewModel.loading {
+                                    ProgressView().tint(.black)
+                                } else {
+                                    Text("Send Reset Link")
+                                        .fontWeight(.bold)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(isEmailValid ? Color(red: 0.83, green: 0.99, blue: 0.24) : Color.gray.opacity(0.3))
+                            .foregroundColor(isEmailValid ? .black : .white.opacity(0.6))
+                            .cornerRadius(12)
+                        }
+                        .disabled(!isEmailValid || viewModel.loading)
+                        
+                        Button(action: {
+                            withAnimation { isForgotPassword = false }
+                        }) {
+                            (Text("Back to ") + Text("Sign In").foregroundColor(.blue).underline())
+                                .font(.footnote)
+                                .foregroundColor(.gray)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .transition(.asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
+                } else {
+                    VStack(spacing: 20) {
+                        if isSignUp {
+                            VStack(alignment: .leading, spacing: 6) {
+                                TextField(text: $username, prompt: Text("Username").foregroundColor(.white.opacity(0.6))) {}
+                                    .padding()
+                                    .background(Color.white.opacity(0.15))
+                                    .cornerRadius(12)
+                                    .foregroundColor(.white)
+                                    .textContentType(.username)
+                                    .autocorrectionDisabled()
+                                    .focused($focusedField, equals: .username)
+                                    .submitLabel(.next)
+                                    .onSubmit { focusedField = .email }
+                                
+                                if !username.isEmpty && !isUsernameValid {
+                                    Text("Username is required")
+                                        .font(.caption2)
+                                        .foregroundColor(.red)
+                                        .padding(.leading, 4)
+                                }
+                            }
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField(text: $email, prompt: Text("Email").foregroundColor(.white.opacity(0.6))) {}
+                                .padding()
+                                .background(Color.white.opacity(0.15))
+                                .cornerRadius(12)
+                                .foregroundColor(.white)
+                                .autocapitalization(.none)
+                                .keyboardType(.emailAddress)
+                                .textContentType(.emailAddress)
+                                .focused($focusedField, equals: .email)
+                                .submitLabel(.next)
+                                .onSubmit { focusedField = .password }
+                            
+                            if !email.isEmpty && !isEmailValid {
+                                Text("Please enter a valid email address")
+                                    .font(.caption2)
+                                    .foregroundColor(.red)
+                                    .padding(.leading, 4)
+                            }
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            ZStack(alignment: .trailing) {
+                                Group {
+                                    if isPasswordVisible {
+                                        TextField(text: $password, prompt: Text("Password").foregroundColor(.white.opacity(0.6))) {}
+                                    } else {
+                                        SecureField(text: $password, prompt: Text("Password").foregroundColor(.white.opacity(0.6))) {}
+                                    }
+                                }
+                                .padding()
+                                .background(Color.white.opacity(0.15))
+                                .cornerRadius(12)
+                                .foregroundColor(.white)
+                                .textContentType(isSignUp ? .newPassword : .password)
+                                .focused($focusedField, equals: .password)
+                                .submitLabel(.done)
+                                
+                                Button(action: { isPasswordVisible.toggle() }) {
+                                    Image(systemName: isPasswordVisible ? "eye.slash.fill" : "eye.fill")
+                                        .foregroundColor(.gray)
+                                        .padding(.trailing, 12)
+                                }
+                            }
+                            
+                            if isSignUp && !password.isEmpty && !isPasswordValid {
+                                Text("Password must be at least 6 characters")
+                                    .font(.caption2)
+                                    .foregroundColor(.red)
+                                    .padding(.leading, 4)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                    
+                    if let error = viewModel.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .padding(.horizontal)
+                    }
+                    
+                    VStack(spacing: 16) {
+                        Button(action: {
+                            Task {
+                                focusedField = nil
+                                if isSignUp {
+                                    await viewModel.signUp(email: email, password: password, username: username)
+                                } else {
+                                    await viewModel.signIn(email: email, password: password)
+                                }
+                            }
+                        }) {
+                            HStack {
+                                if viewModel.loading {
+                                    ProgressView().tint(.black)
+                                } else {
+                                    Text(isSignUp ? "Sign Up" : "Sign In")
+                                        .fontWeight(.bold)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(isFormValid ? Color(red: 0.83, green: 0.99, blue: 0.24) : Color.gray.opacity(0.3))
+                            .foregroundColor(isFormValid ? .black : .white.opacity(0.6))
+                            .cornerRadius(12)
+                        }
+                        .disabled(!isFormValid || viewModel.loading)
+                        
+                        if !isSignUp {
+                            Button(action: {
+                                withAnimation { isForgotPassword = true }
+                            }) {
+                                (Text("Forgot password?").foregroundColor(.blue).underline())
+                                    .font(.footnote)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                    
+                    Button(action: {
+                        Task {
+                            await viewModel.signInWithGoogle()
+                        }
+                    }) {
+                        HStack {
+                            Image(systemName: "g.circle.fill")
+                            Text("Continue with Google")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.white)
+                        .foregroundColor(.black)
+                        .cornerRadius(12)
+                    }
+                    .padding(.horizontal)
+                    
+                    if isSignUp {
+                        VStack(spacing: 4) {
+                            Text("By signing up, you agree to our")
+                                .font(.caption2)
+                                .foregroundColor(.gray)
+                            HStack(spacing: 4) {
+                                Link("Terms of Use", destination: URL(string: "https://grizzled-preface-8af.notion.site/Terms-of-use-2d8cbc70e029808ebafddd273e116b59?pvs=73")!)
+                                    .font(.caption2)
+                                    .underline()
+                                Text("&")
+                                    .font(.caption2)
+                                    .foregroundColor(.gray)
+                                Link("Privacy Policy", destination: URL(string: "https://docs.google.com/document/d/e/2PACX-1vQCLhSzCm1zIUivwlp4nZRDamybgdpCEu9NGNwWBBjE6hboAeyTUSkhTHer5w5xKkgWWrfOKPLIGTxH/pub")!)
+                                    .font(.caption2)
+                                    .underline()
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                    
+                    Button(action: {
+                        withAnimation {
+                            isSignUp.toggle()
+                            viewModel.errorMessage = nil
+                        }
+                    }) {
+                        if isSignUp {
+                            (Text("Already have an account? ")
+                             + Text("Sign In").foregroundColor(.blue).underline())
+                                .font(.footnote)
+                                .foregroundColor(.gray)
+                        } else {
+                            (Text("Don't have an account? ")
+                             + Text("Sign Up").foregroundColor(.blue).underline())
+                                .font(.footnote)
+                                .foregroundColor(.gray)
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .background(Color(red: 0.05, green: 0.07, blue: 0.1).ignoresSafeArea())
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var authViewModel = AuthViewModel()
+    
+    var body: some View {
+        Group {
+            if authViewModel.session != nil && !authViewModel.isUpdatingPassword {
+                MainTabView(authViewModel: authViewModel)
+            } else {
+                AuthView(viewModel: authViewModel)
+            }
+        }
+        .onOpenURL { url in
+            authViewModel.handle(url: url)
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+}
